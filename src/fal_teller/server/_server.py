@@ -106,10 +106,12 @@ class TicketStore:
 
     tickets: Dict[str, Ticket] = field(default_factory=dict)
 
-    def add_ticket(self, provider: ArrowProvider[PathT], normalized_path: PathT) -> str:
+    def add_ticket(
+        self, provider: ArrowProvider[PathT], normalized_path: PathT
+    ) -> bytes:
         ticket = Ticket(provider, normalized_path)
         self.tickets[ticket.token] = ticket
-        return ticket
+        return ticket.serialize()
 
     def use_ticket(self, token: str) -> Ticket:
         ticket = self.tickets.pop(token, None)
@@ -165,10 +167,8 @@ class TellerServer(flight.FlightServerBase):
                 # on do_get with the provider's custom representation).
                 *provider.unpack_path(table_info.path)
             )
-            ticket = self._ticket_store.add_ticket(table_info.path, provider)
-            flight_endpoint = flight.FlightEndpoint(
-                ticket.serialize(), [self._endpoint]
-            )
+            ticket_token = self._ticket_store.add_ticket(table_info.path, provider)
+            flight_endpoint = flight.FlightEndpoint(ticket_token, [self._endpoint])
             yield table_info.to_flight(flight_descriptor, endpoints=[flight_endpoint])
 
     def get_flight_info(
@@ -180,8 +180,8 @@ class TellerServer(flight.FlightServerBase):
 
         # We don't need to create a new descriptor, since we can simply forward what
         # we received.
-        ticket = self._ticket_store.add_ticket(table_info.path, provider)
-        flight_endpoint = flight.FlightEndpoint(ticket.serialize(), [self._endpoint])
+        ticket_token = self._ticket_store.add_ticket(table_info.path, provider)
+        flight_endpoint = flight.FlightEndpoint(ticket_token, [self._endpoint])
         return table_info.to_flight(descriptor, endpoints=[flight_endpoint])
 
     def do_get(
