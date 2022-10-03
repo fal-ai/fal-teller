@@ -1,11 +1,26 @@
+import itertools
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any, Dict, Iterator, List, Literal, Optional
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    Generic,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    TypeVar,
+)
 
 import fsspec
 import pyarrow as arrow
+import snowflake.connector
 from pyarrow import flight, fs, parquet
 from pyarrow.fs import _resolve_filesystem_and_path
+from snowflake.connector import SnowflakeConnection
+
+from fal_teller.server._ddl import generate_ddl
 
 
 @dataclass
@@ -118,8 +133,84 @@ class FileProvider(ArrowProvider[str]):
                 total_bytes=pq_file.metadata.serialized_size,
             )
 
-    def _normalize_path(self, path: str) -> str:
-        return self._file_system.sep.join((self.root_path, path))
+
+@dataclass
+class SnowflakeProvider(ArrowProvider[str]):
+    _SQL_ALCHEMY_DIALECT: ClassVar["str"] = "snowflake://"
+
+    config_options: Dict[str, Any]
+
+    @cached_property
+    def connection(self) -> SnowflakeConnection:
+        return snowflake.connector.connect(**self.config_options)
+
+    def pack_path(self, *path: List[str]) -> str:
+        assert len(path) == 1
+        return path[0]
+
+    def unpack_path(self, path: PathT) -> str:
+        return path
+
+    def read_from(self, path: str, query: Optional[Query]) -> arrow.RecordBatchReader:
+        assert query is None
+
+        with self.connection.cursor() as cursor:
+            cursor.execute(f"SELECT * FROM {path}")
+
+            # Snowflake connector already fetches the first batch for itself,
+            # so we should be able to take a peek at it immediately (and use
+            # it to infer the schema of the whole stream).
+            batches = cursor.fetch_arrow_batches()
+            batch = next(batches, None)
+            assert batch is not None, "there should be at least one batch"
+
+            # Add the batch we have just read to the beginning of the iterator.
+            combined_batches = itertools.chain([batch], batches)
+            return arrow.RecordBatchReader.from_batches(batch.schema, combined_batches)
+
+    def write_to(self, path: str, stream: arrow.RecordBatchReader) -> None:
+        from snowflake.connector.pandas_tools import write_pandas
+
+        with self.connection.cursor() as cursor:
+            create_stmt = generate_ddl(
+                path,
+                dialect=self._SQL_ALCHEMY_DIALECT,
+                schema=stream.schema,
+            )
+            cursor.execute(create_stmt)
+
+        # Since there is no write_arrow in snowflake yet, we can
+        # leverage the existing write_pandas by converting each
+        # batch one by one. This has some overhead.
+        for should_append, batch in enumerate(stream):
+            write_pandas(
+                self.connection,
+                batch.to_pandas(),
+                path,
+                # For the initial batch, we want write_pandas to
+                # create a new table. But all the subsequent ones
+                # will need to append to the existing one.
+                auto_create_table=not should_append,
+                overwrite=not should_append,
+            )
+
+    def info(self, path: str) -> TableInfo[str]:
+        with self.connection.cursor() as cursor:
+            cursor.execute(f"SELECT * FROM {path} LIMIT 0")
+
+            # Even though this query did not return any data in,
+            # snowflake still can construct an empty arrow table
+            # with the schema of the whole table.
+            [sf_batch] = cursor.get_result_batches()
+            empty_arrow_table = sf_batch._create_empty_table()
+
+        return TableInfo(
+            schema=empty_arrow_table.schema,
+            path=path,
+            # For snowflake, we don't know these (maybe we can do count(*)?)
+            total_records=-1,
+            total_bytes=-1,
+        )
 
 
 def get_provider(provider_type: str, *args: Any, **kwargs: Any) -> ArrowProvider:
