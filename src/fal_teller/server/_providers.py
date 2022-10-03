@@ -13,10 +13,13 @@ class Query:
     """A partial filter for what to list."""
 
 
+PathT = TypeVar("PathT")
+
+
 @dataclass
-class TableInfo:
+class TableInfo(Generic[PathT]):
     schema: arrow.Schema
-    path: str
+    path: PathT
     total_records: int = -1
     total_bytes: int = -1
 
@@ -35,58 +38,65 @@ class TableInfo:
 
 
 @dataclass
-class ArrowProvider:
+class ArrowProvider(Generic[PathT]):
     """An arrow provider that can stream data inwards or outwards."""
 
-    def write_to(self, path: str, stream: arrow.RecordBatchReader) -> None:
+    def pack_path(self, *parts: str) -> PathT:
         raise NotImplementedError
 
-    def read_from(self, path: str, query: Optional[Query]) -> arrow.RecordBatchReader:
+    def unpack_path(self, path: PathT) -> str:
         raise NotImplementedError
 
-    def info(self, path: str) -> TableInfo:
+    def write_to(self, path: PathT, stream: arrow.RecordBatchReader) -> None:
         raise NotImplementedError
 
-    def list(self) -> Iterator[TableInfo]:
+    def read_from(self, path: PathT, query: Optional[Query]) -> arrow.RecordBatchReader:
+        raise NotImplementedError
+
+    def info(self, path: PathT) -> TableInfo[PathT]:
+        raise NotImplementedError
+
+    def list(self) -> Iterator[TableInfo[PathT]]:
         raise NotImplementedError
 
 
 @dataclass
-class FileProvider(ArrowProvider):
+class FileProvider(ArrowProvider[str]):
     file_system: str
     config_options: Dict[str, Any] = field(default_factory=dict)
     root_path: Optional[None] = None
     file_type: Literal["parquet"] = "parquet"
 
-    def __post_init__(self):
-        assert self.file_type == "parquet"
-
     @cached_property
-    def _file_system(self) -> fsspec.AbstractFileSystem:
+    def connection(self) -> fsspec.AbstractFileSystem:
         return fsspec.filesystem(self.file_system, **self.config_options)
+
+    def pack_path(self, *parts: List[str]) -> str:
+        return self.connection.sep.join((self.root_path, *parts))
+
+    def unpack_path(self, path: PathT) -> str:
+        # We should probably take a relative against the root
+        # path here.
+        raise NotImplementedError
+        return path
 
     def read_from(self, path: str, query: Optional[Query]) -> arrow.RecordBatchReader:
         assert query is None
-        filesystem, arrow_path = _resolve_filesystem_and_path(
-            self._normalize_path(path), self._file_system
-        )
+        filesystem, arrow_path = _resolve_filesystem_and_path(path, self.connection)
         pq_file = parquet.ParquetFile(filesystem.open_input_file(arrow_path))
-        return arrow.RecordBatchReader.from_batches(
-            pq_file.schema.to_arrow_schema(), pq_file.iter_batches()
-        )
+        arrow_schema = pq_file.schema.to_arrow_schema()
+        arrow_records = pq_file.iter_batches()
+        return arrow.RecordBatchReader.from_batches(arrow_schema, arrow_records)
 
     def write_to(self, path: str, stream: arrow.RecordBatchReader) -> None:
-        path = self._normalize_path(path)
         with parquet.ParquetWriter(
-            path, stream.schema, filesystem=self._file_system
+            path, stream.schema, filesystem=self.connection
         ) as writer:
             for batch in stream:
                 writer.write_batch(batch)
 
-    def info(self, path: str) -> TableInfo:
-        filesystem, arrow_path = _resolve_filesystem_and_path(
-            self._normalize_path(path), self._file_system
-        )
+    def info(self, path: str) -> TableInfo[str]:
+        filesystem, arrow_path = _resolve_filesystem_and_path(path, self.connection)
         pq_file = parquet.ParquetFile(filesystem.open_input_file(arrow_path))
         return TableInfo(
             schema=pq_file.schema.to_arrow_schema(),
@@ -95,10 +105,8 @@ class FileProvider(ArrowProvider):
             total_bytes=pq_file.metadata.serialized_size,
         )
 
-    def list(self, path: str) -> Iterator[TableInfo]:
-        filesystem, arrow_path = _resolve_filesystem_and_path(
-            self._normalize_path(path), self._file_system
-        )
+    def list(self, path: str) -> Iterator[TableInfo[str]]:
+        filesystem, arrow_path = _resolve_filesystem_and_path(path, self.connection)
         for file_info in filesystem.get_file_info(
             fs.FileSelector(arrow_path, recursive=True)
         ):

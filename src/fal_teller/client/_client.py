@@ -119,7 +119,7 @@ class TellerClient:
         *,
         profile: TellerProfile,
     ) -> flight.FlightDescriptor:
-        return flight.FlightDescriptor.for_path(profile.name, table_name)
+        return flight.FlightDescriptor.for_path(table_name)
 
     @cached_property
     def _client(self) -> flight.FlightClient:

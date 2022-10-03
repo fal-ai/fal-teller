@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import secrets
 import shelve
-from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, ClassVar, Dict, Iterator, Optional, Tuple
 
 from pyarrow import flight
 
-from fal_teller.server._providers import ArrowProvider, get_provider
+from fal_teller.server._providers import ArrowProvider, PathT, get_provider
 
 TOKEN_DB_PATH = "/tmp/tokens.db"
 
@@ -81,65 +83,113 @@ class AuthenticationMiddleware(flight.ServerMiddleware):
         return {}
 
 
+@dataclass
+class Ticket:
+    MAX_VALIDITY: ClassVar[timedelta] = timedelta(minutes=120)
+
+    path: PathT
+    provider: ArrowProvider[PathT]
+    token: str = field(default_factory=secrets.token_urlsafe)
+    generated_time: datetime = field(default_factory=datetime.now)
+
+    def is_valid(self) -> bool:
+        return self.generated_time + self.MAX_VALIDITY > datetime.now()
+
+    def serialize(self) -> bytes:
+        return self.token.encode("utf-8")
+
+
+@dataclass
+class TicketStore:
+    """Tickets generated from the get_flight_info calls. They are single-use, have
+    limited time validity (120 minutes) and can be used without authentication."""
+
+    tickets: Dict[str, Ticket] = field(default_factory=dict)
+
+    def add_ticket(self, provider: ArrowProvider[PathT], normalized_path: PathT) -> str:
+        ticket = Ticket(provider, normalized_path)
+        self.tickets[ticket.token] = ticket
+        return ticket
+
+    def use_ticket(self, token: str) -> Ticket:
+        ticket = self.tickets.pop(token, None)
+        if ticket is None:
+            raise flight.FlightUnauthenticatedError("Invalid ticket token!")
+
+        if not ticket.is_valid():
+            raise flight.FlightUnauthenticatedError(
+                f"Ticket expired at {ticket.generated_time + ticket.MAX_VALIDITY}!"
+            )
+
+        return ticket
+
+
 class TellerServer(flight.FlightServerBase):
     def __init__(self, location: str, *args, **kwargs) -> None:
         self._endpoint = location
+        self._ticket_store = TicketStore()
         super().__init__(
             location=location, middleware={"auth": AuthenticationMiddlewareFactory()}
         )
 
-    def _profile_from(
-        self, context: flight.ServerCallContext
-    ) -> Tuple[str, ArrowProvider]:
-        auth_middleware = context.get_middleware("auth")
+    def _profile_from(self, context: flight.ServerCallContext) -> ArrowProvider:
+        auth_middleware: AuthenticationMiddleware = context.get_middleware("auth")
         if auth_middleware is None:
             raise flight.FlightUnauthenticatedError("Client must use authentication!")
-        return auth_middleware.profile_name, auth_middleware.provider
+        return auth_middleware.provider
 
     def _unpack_descriptor(
-        self, descriptor: flight.FlightDescriptor
-    ) -> Tuple[str, str]:
-        if len(descriptor.path) != 2:
-            raise flight.FlightError(
-                f"Flight descriptors must always have a path of len 2, not '{len(descriptor.path)}'"
-            )
-
-        profile_name, descriptor_path = descriptor.path
-        return profile_name.decode(), descriptor_path.decode()
+        self,
+        provider: ArrowProvider[PathT],
+        descriptor: flight.FlightDescriptor,
+    ) -> PathT:
+        # Descriptors store paths as bytes, so we need to decode it before
+        # actually normalizing it.
+        parts = [part.decode() for part in descriptor.path]
+        return provider.pack_path(*parts)
 
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes
     ) -> Iterator[flight.FlightInfo]:
+        # Flight accepts a list of criteria for the search (like
+        # query only the tables starting with prefix F_, etc). We
+        # currently do not support it.
         assert parse_criteria(criteria) is None
-        profile_name, provider = self._profile_from(context)
+
+        provider = self._profile_from(context)
         for table_info in provider.list():
             flight_descriptor = flight.FlightDescriptor.for_path(
-                profile_name, table_info.path
+                # This is going to be the same descriptor that the
+                # do_get is going to parse, so we need to serialize
+                # the path in the native Arrow form (and load it back
+                # on do_get with the provider's custom representation).
+                *provider.unpack_path(table_info.path)
             )
-            flight_endpoint = flight.FlightEndpoint(table_info.path, [self._endpoint])
+            ticket = self._ticket_store.add_ticket(table_info.path, provider)
+            flight_endpoint = flight.FlightEndpoint(
+                ticket.serialize(), [self._endpoint]
+            )
             yield table_info.to_flight(flight_descriptor, endpoints=[flight_endpoint])
 
     def get_flight_info(
         self, context: flight.ServerCallContext, descriptor: flight.FlightDescriptor
     ) -> flight.FlightInfo:
-        profile_name, provider = self._profile_from(context)
-        requested_profile_name, requested_path = self._unpack_descriptor(descriptor)
-        if requested_profile_name != profile_name:
-            raise flight.FlightUnauthenticatedError(
-                f"Can't request profile '{requested_profile_name}' while being authenticated to {profile_name}!"
-            )
-
+        provider = self._profile_from(context)
+        requested_path = self._unpack_descriptor(provider, descriptor)
         table_info = provider.info(requested_path)
-        flight_endpoint = flight.FlightEndpoint(requested_path, [self._endpoint])
+
+        # We don't need to create a new descriptor, since we can simply forward what
+        # we received.
+        ticket = self._ticket_store.add_ticket(table_info.path, provider)
+        flight_endpoint = flight.FlightEndpoint(ticket.serialize(), [self._endpoint])
         return table_info.to_flight(descriptor, endpoints=[flight_endpoint])
 
     def do_get(
         self, context: flight.ServerCallContext, ticket: flight.Ticket
     ) -> flight.FlightDataStream:
-        profile_name, provider = self._profile_from(context)
-        ticket_path = ticket.ticket.decode("utf-8")
-
-        reader = provider.read_from(ticket_path, query=None)
+        token = ticket.ticket.decode("utf-8")
+        ticket = self._ticket_store.use_ticket(token)
+        reader = ticket.provider.read_from(ticket.path, query=None)
         return flight.RecordBatchStream(reader)
 
     def do_put(
@@ -149,13 +199,8 @@ class TellerServer(flight.FlightServerBase):
         reader: flight.MetadataRecordBatchReader,
         writer: flight.FlightMetadataWriter,
     ) -> None:
-        profile_name, provider = self._profile_from(context)
-        target_profile_name, target_path = self._unpack_descriptor(descriptor)
-        if target_profile_name != profile_name:
-            raise flight.FlightUnauthenticatedError(
-                f"Can't request profile '{target_profile_name}' while being authenticated to {profile_name}!"
-            )
-
+        provider = self._profile_from(context)
+        target_path = self._unpack_descriptor(provider, descriptor)
         provider.write_to(target_path, reader.to_reader())
 
     def list_actions(self, context):
