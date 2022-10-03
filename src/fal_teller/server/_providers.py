@@ -145,9 +145,10 @@ class SnowflakeProvider(ArrowProvider[str]):
     def connection(self) -> SnowflakeConnection:
         return snowflake.connector.connect(**self.config_options)
 
-    def pack_path(self, *path: List[str]) -> str:
+    def pack_path(self, *path: str) -> str:
         assert len(path) == 1
-        return path[0]
+        # Tables in snowflake should be capitalized?
+        return path[0].upper()
 
     def unpack_path(self, path: PathT) -> str:
         return cast(str, path)
@@ -161,13 +162,21 @@ class SnowflakeProvider(ArrowProvider[str]):
             # Snowflake connector already fetches the first batch for itself,
             # so we should be able to take a peek at it immediately (and use
             # it to infer the schema of the whole stream).
-            batches = cursor.fetch_arrow_batches()
-            batch = next(batches, None)
-            assert batch is not None, "there should be at least one batch"
+            table_batches = cursor.fetch_arrow_batches()
+            fist_table = next(table_batches, None)
+            assert fist_table is not None, "there should be at least one batch"
 
-            # Add the batch we have just read to the beginning of the iterator.
-            combined_batches = itertools.chain([batch], batches)
-            return arrow.RecordBatchReader.from_batches(batch.schema, combined_batches)
+            # Snowflake returns an iterator of arrow tables, not record batches
+            # so we need to convert them (but this has no overhead, since the underlying
+            # conversion is zero-copy).
+            return arrow.RecordBatchReader.from_batches(
+                fist_table.schema,
+                (
+                    batch
+                    for table in itertools.chain([fist_table], table_batches)
+                    for batch in table.to_batches()
+                ),
+            )
 
     def write_to(self, path: str, stream: arrow.RecordBatchReader) -> None:
         from snowflake.connector.pandas_tools import write_pandas
@@ -217,5 +226,7 @@ class SnowflakeProvider(ArrowProvider[str]):
 def get_provider(provider_type: str, *args: Any, **kwargs: Any) -> ArrowProvider:
     if provider_type == "file":
         return FileProvider(*args, **kwargs)
+    elif provider_type == "snowflake":
+        return SnowflakeProvider(*args, **kwargs)
     else:
         raise NotImplementedError(provider_type)

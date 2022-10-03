@@ -25,8 +25,8 @@ def process_data(teller_client: TellerClient) -> None:
 
 teller_client = TellerClient(
     "grpc://localhost:1997",
-    token="batuhan_token",
-    default_profile="profile_2",
+    token="database_token",
+    default_profile="profile_3",
 )
 seed_data(teller_client)
 process_data(teller_client)

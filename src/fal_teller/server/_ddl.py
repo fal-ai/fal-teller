@@ -30,4 +30,4 @@ def generate_ddl(path: str, dialect: str, schema: arrow.Schema) -> str:
     )
 
     create_stmt = CreateTable(pandas_sql_table.table, if_not_exists=True)
-    return create_stmt.compile(mock_engine)
+    return str(create_stmt.compile(mock_engine))
