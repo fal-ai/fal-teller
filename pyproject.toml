@@ -6,7 +6,15 @@ authors = ["Batuhan Taskaya <isidentical@gmail.com>"]
 
 [tool.poetry.dependencies]
 python = "^3.9"
-pyarrow = "9"
+pyarrow = "^8"
+fsspec = { version = "*", optional = true }
+snowflake-connector-python = { version = "^2.8", optional = true }
+
+
+[tool.poetry.extras]
+file = ["fsspec"]
+snowflake = ["snowflake-connector-python"]
+
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
@@ -21,3 +29,7 @@ force_grid_wrap=0
 include_trailing_comma=true
 multi_line_output=3
 use_parentheses=true
+
+[tool.poetry.plugins."fal_teller.server.providers"]
+"file" = "fal_teller.server.providers.file:FileProvider"
+"snowflake" = "fal_teller.server.providers.snowflake:SnowflakeProvider"

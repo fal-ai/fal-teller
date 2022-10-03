@@ -20,7 +20,7 @@ from typing import (
 
 from pyarrow import flight
 
-from fal_teller.server._providers import ArrowProvider, PathT, get_provider
+from fal_teller.server.providers import ArrowProvider, PathT, get_provider
 
 TOKEN_DB_PATH = "/tmp/tokens.db"
 
