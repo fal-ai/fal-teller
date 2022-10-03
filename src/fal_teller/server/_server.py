@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import functools
 import json
 import secrets
 import shelve
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, ClassVar, Dict, Iterator, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterator,
+    Literal,
+    Optional,
+    Tuple,
+    TypeVar,
+)
 
 from pyarrow import flight
 
@@ -124,6 +135,27 @@ class TicketStore:
         return ticket
 
 
+ReturnT = TypeVar("ReturnT")
+
+
+def requires_auth(function: Callable[..., ReturnT]) -> Callable[..., ReturnT]:
+    """Mark the given function as requiring authentication. If the user is not
+    authenticated at the request time, it will raise a FlightUnauthenticatedError.
+    Otherwise the wrapped function will receive a 'provider' argument with the
+    authenticated arrow provider."""
+
+    @functools.wraps(function)
+    def wrapper(self, context: flight.ServerCallContext, *args, **kwargs) -> ReturnT:
+        auth_middleware: AuthenticationMiddleware = context.get_middleware("auth")
+        if auth_middleware is None:
+            raise flight.FlightUnauthenticatedError("Client must use authentication!")
+        return function(
+            self, context, *args, provider=auth_middleware.provider, **kwargs
+        )
+
+    return wrapper
+
+
 class TellerServer(flight.FlightServerBase):
     def __init__(self, location: str, *args, **kwargs) -> None:
         self._endpoint = location
@@ -131,12 +163,6 @@ class TellerServer(flight.FlightServerBase):
         super().__init__(
             location=location, middleware={"auth": AuthenticationMiddlewareFactory()}
         )
-
-    def _profile_from(self, context: flight.ServerCallContext) -> ArrowProvider:
-        auth_middleware: AuthenticationMiddleware = context.get_middleware("auth")
-        if auth_middleware is None:
-            raise flight.FlightUnauthenticatedError("Client must use authentication!")
-        return auth_middleware.provider
 
     def _unpack_descriptor(
         self,
@@ -148,15 +174,18 @@ class TellerServer(flight.FlightServerBase):
         parts = [part.decode() for part in descriptor.path]
         return provider.pack_path(*parts)
 
+    @requires_auth
     def list_flights(
-        self, context: flight.ServerCallContext, criteria: bytes
+        self,
+        context: flight.ServerCallContext,
+        provider: ArrowProvider,
+        criteria: bytes,
     ) -> Iterator[flight.FlightInfo]:
         # Flight accepts a list of criteria for the search (like
         # query only the tables starting with prefix F_, etc). We
         # currently do not support it.
         assert parse_criteria(criteria) is None
 
-        provider = self._profile_from(context)
         for table_info in provider.list():
             flight_descriptor = flight.FlightDescriptor.for_path(
                 # This is going to be the same descriptor that the
@@ -169,10 +198,13 @@ class TellerServer(flight.FlightServerBase):
             flight_endpoint = flight.FlightEndpoint(ticket_token, [self._endpoint])
             yield table_info.to_flight(flight_descriptor, endpoints=[flight_endpoint])
 
+    @requires_auth
     def get_flight_info(
-        self, context: flight.ServerCallContext, descriptor: flight.FlightDescriptor
+        self,
+        context: flight.ServerCallContext,
+        descriptor: flight.FlightDescriptor,
+        provider: ArrowProvider,
     ) -> flight.FlightInfo:
-        provider = self._profile_from(context)
         requested_path = self._unpack_descriptor(provider, descriptor)
         table_info = provider.info(requested_path)
 
@@ -190,14 +222,15 @@ class TellerServer(flight.FlightServerBase):
         reader = ticket.provider.read_from(ticket.path, query=None)
         return flight.RecordBatchStream(reader)
 
+    @requires_auth
     def do_put(
         self,
         context: flight.ServerCallContext,
         descriptor: flight.FlightDescriptor,
         reader: flight.MetadataRecordBatchReader,
         writer: flight.FlightMetadataWriter,
+        provider: ArrowProvider,
     ) -> None:
-        provider = self._profile_from(context)
         target_path = self._unpack_descriptor(provider, descriptor)
         provider.write_to(target_path, reader.to_reader())
 
