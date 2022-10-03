@@ -11,6 +11,7 @@ from typing import (
     Literal,
     Optional,
     TypeVar,
+    cast,
 )
 
 import fsspec
@@ -86,7 +87,7 @@ class FileProvider(ArrowProvider[str]):
     def connection(self) -> fsspec.AbstractFileSystem:
         return fsspec.filesystem(self.file_system, **self.config_options)
 
-    def pack_path(self, *parts: List[str]) -> str:
+    def pack_path(self, *parts: str) -> str:
         return self.connection.sep.join((self.root_path, *parts))
 
     def unpack_path(self, path: PathT) -> str:
@@ -120,7 +121,7 @@ class FileProvider(ArrowProvider[str]):
             total_bytes=pq_file.metadata.serialized_size,
         )
 
-    def list(self, path: str) -> Iterator[TableInfo[str]]:
+    def list(self, path: str) -> Iterator[TableInfo[str]]:  # type: ignore[override]
         filesystem, arrow_path = _resolve_filesystem_and_path(path, self.connection)
         for file_info in filesystem.get_file_info(
             fs.FileSelector(arrow_path, recursive=True)
@@ -149,7 +150,7 @@ class SnowflakeProvider(ArrowProvider[str]):
         return path[0]
 
     def unpack_path(self, path: PathT) -> str:
-        return path
+        return cast(str, path)
 
     def read_from(self, path: str, query: Optional[Query]) -> arrow.RecordBatchReader:
         assert query is None

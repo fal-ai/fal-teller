@@ -14,7 +14,7 @@ from fal_teller.server._providers import ArrowProvider, PathT, get_provider
 TOKEN_DB_PATH = "/tmp/tokens.db"
 
 
-def parse_criteria(raw_criteria: str) -> Optional[Dict[str, Any]]:
+def parse_criteria(raw_criteria: bytes) -> Optional[Dict[str, Any]]:
     """Each criteria must be either empty or a json-encoded data
     from the client."""
     if not raw_criteria:
@@ -87,8 +87,8 @@ class AuthenticationMiddleware(flight.ServerMiddleware):
 class Ticket:
     MAX_VALIDITY: ClassVar[timedelta] = timedelta(minutes=120)
 
-    path: PathT
-    provider: ArrowProvider[PathT]
+    path: Any
+    provider: ArrowProvider[Any]
     token: str = field(default_factory=secrets.token_urlsafe)
     generated_time: datetime = field(default_factory=datetime.now)
 
@@ -106,10 +106,8 @@ class TicketStore:
 
     tickets: Dict[str, Ticket] = field(default_factory=dict)
 
-    def add_ticket(
-        self, provider: ArrowProvider[PathT], normalized_path: PathT
-    ) -> bytes:
-        ticket = Ticket(provider, normalized_path)
+    def add_ticket(self, normalized_path: Any, provider: ArrowProvider[Any]) -> bytes:
+        ticket = Ticket(normalized_path, provider)
         self.tickets[ticket.token] = ticket
         return ticket.serialize()
 

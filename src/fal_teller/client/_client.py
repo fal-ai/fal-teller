@@ -77,7 +77,11 @@ class TellerClient:
 
     @overload
     def read(
-        self, from_: str, format: Literal["pandas"], *, profile: Optional[str] = None
+        self,
+        from_: str,
+        format: Literal["pandas"] = "pandas",
+        *,
+        profile: Optional[str] = None,
     ) -> pandas.DataFrame:
         ...
 
